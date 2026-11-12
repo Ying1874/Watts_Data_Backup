@@ -1,0 +1,40 @@
+# Local test fixtures, diagnostics and review reports
+/docs/
+/tests/
+/test_*.sh
+/generate_test_*
+
+# Previous versions and editor temporary files
+*.back
+*.bak
+*.preflight_before
+*.history_before
+*.orig
+*.rej
+*.tmp
+*~
+.vscode/
+.idea/
+.codex/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Runtime data and state do not belong in the source repository
+vpfi_data/
+vpfi_data_backup/
+*_state/
+*.log
+*.pid
+*.lock
+*.state
+*.state_detail
+ledger*.tsv
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
