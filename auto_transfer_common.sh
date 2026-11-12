@@ -79,8 +79,12 @@ IPC_RETENTION_PERFORMED=false
 IPC_FORCE_FULL_AUDIT="${IPC_FORCE_FULL_AUDIT:-false}"
 IPC_FORCE_RETENTION="${IPC_FORCE_RETENTION:-false}"
 IPC_FAST_SKIP_TOTAL=0
-# The optional reader is active only in the copy-phase history lookup.
+# Copy fingerprints and cleanup mtimes use separate, read-only sessions.
 IPC_HISTORY_ACTIVE=false
+IPC_HISTORY_MODE=fingerprint
+IPC_HISTORY_VALUE_RESULT=""
+IPC_INDEX_TEMP_FILE=""
+IPC_INDEX_TEMP_OWNER=""
 IPC_HISTORY_DISABLED=false
 IPC_HISTORY_WORKER_PID=""
 IPC_HISTORY_OWNER_PID=""
@@ -584,6 +588,7 @@ cleanup_runtime() {
     local recorded_pid=""
 
     stop_ipc_history_reader || true
+    cleanup_ipc_index_temp_file || true
     flush_ledger_buffer || true
     cleanup_ipc_preflight_metadata_temp_files || true
 
@@ -1532,9 +1537,19 @@ ipc_history_read_field() {
 }
 
 start_ipc_history_reader() {
+    local mode=${1:-fingerprint} expected_version=ipc-history-v1
+    local -a mode_args=()
+    case "$mode" in
+        fingerprint) ;;
+        mtime) expected_version=ipc-mtime-v1; mode_args=(mtime) ;;
+        *) return 1 ;;
+    esac
     local helper=${IPC_HISTORY_READER_HELPER:-$SCRIPT_DIR/auto_transfer_ipc_metadata.py}
     local ready="" version="" ready_pid="" pipe_trap="" coproc_read="" coproc_write=""
-    $IPC_HISTORY_ACTIVE && return 0
+    if $IPC_HISTORY_ACTIVE; then
+        [[ "$IPC_HISTORY_MODE" == "$mode" ]]
+        return
+    fi
     $IPC_HISTORY_DISABLED && return 1
     [[ "${IPC_HISTORY_READER_ENABLED:-true}" == true ]] || return 1
     IPC_HISTORY_TIMEOUT=${IPC_HISTORY_READER_TIMEOUT_SECONDS:-5}
@@ -1550,6 +1565,7 @@ start_ipc_history_reader() {
     fi
     check_interruption_requested
     IPC_HISTORY_OWNER_PID=$BASHPID
+    IPC_HISTORY_MODE=$mode
     IPC_HISTORY_TZ_SET=${TZ+x}
     IPC_HISTORY_TZ=${TZ-}
     IPC_HISTORY_STARTTIME=""
@@ -1559,7 +1575,7 @@ start_ipc_history_reader() {
         if [[ -n "$IPC_PREFLIGHT_METADATA_GUARD_FD" ]]; then
             exec {IPC_PREFLIGHT_METADATA_GUARD_FD}>&-
         fi
-        exec python3 -I -u "$helper" "$IPC_HISTORY_OWNER_PID"
+        exec python3 -I -u "$helper" "$IPC_HISTORY_OWNER_PID" "${mode_args[@]}"
     } 2>> "$LOG_FILE"
     IPC_HISTORY_WORKER_PID=${IPC_HISTORY_READER_PID:-}
     coproc_read=${IPC_HISTORY_READER[0]:-}
@@ -1580,16 +1596,19 @@ start_ipc_history_reader() {
     if ! ipc_history_read_field ready 16 ||
        ! ipc_history_read_field version 32 ||
        ! ipc_history_read_field ready_pid 32 ||
-       [[ "$ready" != READY || "$version" != ipc-history-v1 || "$ready_pid" != "$IPC_HISTORY_WORKER_PID" ]]; then
+       [[ "$ready" != READY || "$version" != "$expected_version" || "$ready_pid" != "$IPC_HISTORY_WORKER_PID" ]]; then
         check_interruption_requested
         disable_ipc_history_reader handshake_failed; return 1
     fi
     IPC_HISTORY_ACTIVE=true
-    log_info "IPC history reader started: pid = [$IPC_HISTORY_WORKER_PID], fresh per-request fingerprints, timeout_s = [$IPC_HISTORY_TIMEOUT]" || true
+    log_info "IPC history reader started: pid = [$IPC_HISTORY_WORKER_PID], mode = [$mode], fresh per-request metadata, timeout_s = [$IPC_HISTORY_TIMEOUT]" || true
     return 0
 }
 
-query_ipc_history_fingerprint() {
+query_ipc_metadata() {
+    local mode=${2:-fingerprint}
+    IPC_HISTORY_VALUE_RESULT=""
+    [[ "$mode" == "$IPC_HISTORY_MODE" ]] || return 2
     local pathname=$1 response_id="" response_status="" response_fp="" write_ok=false
     local LC_ALL=C
     [[ "${TZ+x}" == "$IPC_HISTORY_TZ_SET" && "${TZ-}" == "$IPC_HISTORY_TZ" ]] || return 2
@@ -1614,13 +1633,24 @@ query_ipc_history_fingerprint() {
     check_interruption_requested
     [[ "$response_id" == "$IPC_HISTORY_SEQUENCE" ]] || return 2
     if [[ "$response_status" == MISS && -z "$response_fp" ]]; then
-        FILE_FINGERPRINT_RESULT=""
+        IPC_HISTORY_VALUE_RESULT=""
         IPC_HISTORY_REQUESTS=$((IPC_HISTORY_REQUESTS + 1))
         return 1
     fi
     [[ "$response_status" == OK ]] || return 2
+    if [[ "$mode" == mtime ]]; then
+        # Canonical decimal time_t only: reject octal, arithmetic expressions
+        # and values which would wrap Bash's signed integer comparison.
+        [[ "$response_fp" =~ ^(-[1-9][0-9]{0,18}|0|[1-9][0-9]{0,18})$ ]] || return 2
+        local magnitude=${response_fp#-} maximum=9223372036854775807
+        [[ "$response_fp" != -* ]] || maximum=9223372036854775808
+        if (( ${#magnitude} == 19 )) && [[ "$magnitude" > "$maximum" ]]; then return 2; fi
+        IPC_HISTORY_VALUE_RESULT=$response_fp
+        IPC_HISTORY_REQUESTS=$((IPC_HISTORY_REQUESTS + 1))
+        return 0
+    fi
     [[ "$response_fp" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}\ [+-][0-9]{4}:[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}\ [+-][0-9]{4}$ ]] || return 2
-    FILE_FINGERPRINT_RESULT=$response_fp
+    IPC_HISTORY_VALUE_RESULT=$response_fp
     IPC_HISTORY_REQUESTS=$((IPC_HISTORY_REQUESTS + 1))
     return 0
 }
@@ -1628,8 +1658,11 @@ query_ipc_history_fingerprint() {
 calculate_history_fingerprint_to_result() {
     local result
     if [[ "${IPC_HISTORY_READER_SCOPE:-false}" == true ]] && $IPC_HISTORY_ACTIVE; then
-        if query_ipc_history_fingerprint "$1"; then return 0; else result=$?; fi
-        (( result != 1 )) || return 1
+        if query_ipc_metadata "$1" fingerprint; then
+            FILE_FINGERPRINT_RESULT=$IPC_HISTORY_VALUE_RESULT
+            return 0
+        else result=$?; fi
+        if (( result == 1 )); then FILE_FINGERPRINT_RESULT=""; return 1; fi
         disable_ipc_history_reader request_failed
     fi
     check_interruption_requested
@@ -1664,41 +1697,68 @@ ipc_verified_index_matches() {
     return 0
 }
 
+cleanup_ipc_index_temp_file() {
+    [[ -n "$IPC_INDEX_TEMP_FILE" ]] || return 0
+    [[ "$BASHPID" == "$IPC_INDEX_TEMP_OWNER" ]] || return 0
+    rm -f -- "$IPC_INDEX_TEMP_FILE" || return 1
+    IPC_INDEX_TEMP_FILE=""
+}
+
 commit_ipc_verified_index() {
-    local index_parent
-    local temp_index
-    local source_file
+    local index_parent temp_index source_file
+    local write_status=0 record_count=0 started=$SECONDS
 
     $DRY_RUN && return 0
     $IPC_VERIFIED_INDEX_DIRTY || return 0
+    # Do not overwrite tracking if a previous failed attempt could not clean up.
+    cleanup_ipc_index_temp_file || return 1
+    [[ -z "$IPC_INDEX_TEMP_FILE" ]] || return 1
     index_parent=${IPC_VERIFIED_INDEX_FILE%/*}
     mkdir -p "$index_parent" || return 1
     temp_index=$(mktemp "$index_parent/.ipc_verified_index.XXXXXX") || return 1
-    printf '%s\0' "auto_transfer_ipc_verified_index_v1" > "$temp_index" || {
-        rm -f -- "$temp_index"
+    IPC_INDEX_TEMP_FILE=$temp_index
+    IPC_INDEX_TEMP_OWNER=$BASHPID
+    log_info "IPC index persist starting: file = [$IPC_VERIFIED_INDEX_FILE]" || true
+    # Only index bytes belong in this group. Explicitly check every printf:
+    # callers use this function in an if, which disables Bash errexit here.
+    {
+        if ! printf '%s\0' "auto_transfer_ipc_verified_index_v1"; then
+            write_status=1
+        else
+            for source_file in "${!IPC_VERIFIED_SOURCE_FINGERPRINTS[@]}"; do
+                [[ "$INTERRUPT_REQUESTED" != true ]] || check_interruption_requested
+                if ! printf '%s\0%s\0%s\0%s\0%s\0' \
+                    "$source_file" \
+                    "${IPC_VERIFIED_TARGET_PATHS[$source_file]}" \
+                    "${IPC_VERIFIED_SOURCE_FINGERPRINTS[$source_file]}" \
+                    "${IPC_VERIFIED_TARGET_FINGERPRINTS[$source_file]}" \
+                    "${IPC_VERIFIED_SHA256[$source_file]:-}"; then
+                    write_status=1
+                    break
+                fi
+                ((record_count += 1))
+            done
+        fi
+    } > "$temp_index" || write_status=1
+    if (( write_status != 0 )); then
+        cleanup_ipc_index_temp_file || true
         return 1
-    }
-    for source_file in "${!IPC_VERIFIED_SOURCE_FINGERPRINTS[@]}"; do
-        printf '%s\0%s\0%s\0%s\0%s\0' \
-            "$source_file" \
-            "${IPC_VERIFIED_TARGET_PATHS[$source_file]}" \
-            "${IPC_VERIFIED_SOURCE_FINGERPRINTS[$source_file]}" \
-            "${IPC_VERIFIED_TARGET_FINGERPRINTS[$source_file]}" \
-            "${IPC_VERIFIED_SHA256[$source_file]:-}" >> "$temp_index" || {
-            rm -f -- "$temp_index"
-            return 1
-        }
-    done
-    sync "$temp_index" || {
-        rm -f -- "$temp_index"
+    fi
+    if ! sync "$temp_index"; then
+        cleanup_ipc_index_temp_file || true
         return 1
-    }
-    mv -f -- "$temp_index" "$IPC_VERIFIED_INDEX_FILE" || {
-        rm -f -- "$temp_index"
+    fi
+    check_interruption_requested
+    if ! mv -f -- "$temp_index" "$IPC_VERIFIED_INDEX_FILE"; then
+        cleanup_ipc_index_temp_file || true
         return 1
-    }
+    fi
+    IPC_INDEX_TEMP_FILE=""
+    # A failure here is after rename: keep DIRTY and report failure, since the
+    # new complete index is visible but filesystem durability is unconfirmed.
     sync -f "$index_parent" || return 1
     IPC_VERIFIED_INDEX_DIRTY=false
+    log_info "IPC index persist complete: records = [$record_count], duration_s = [$((SECONDS - started))]" || true
     return 0
 }
 
@@ -3510,12 +3570,50 @@ move_files_with_rsync() {
 # ======================
 # 清理旧文件
 # ======================
+get_ipc_retention_mtime_to_result() {
+    local file_path=$1 status
+    FILE_MTIME_EPOCH_RESULT=""
+    if [[ "${IPC_RETENTION_READER_SCOPE:-false}" == true &&
+          "${IPC_RETENTION_READER_ENABLED:-true}" == true ]] && ! $DRY_RUN; then
+        if ! $IPC_HISTORY_ACTIVE && ! $IPC_HISTORY_DISABLED; then
+            if start_ipc_history_reader mtime; then IPC_RETENTION_OWNS_READER=true; fi
+        fi
+        if $IPC_HISTORY_ACTIVE && [[ "$IPC_HISTORY_MODE" == mtime ]]; then
+            if query_ipc_metadata "$file_path" mtime; then
+                FILE_MTIME_EPOCH_RESULT=$IPC_HISTORY_VALUE_RESULT
+                return 0
+            else status=$?; fi
+            # An explicit MISS is not a deletion candidate, just like failed
+            # stat. Transport/protocol faults must retry the original stat.
+            (( status != 1 )) || return 1
+            disable_ipc_history_reader retention_request_failed
+        fi
+    fi
+    check_interruption_requested
+    FILE_MTIME_EPOCH_RESULT=$(get_file_mtime_epoch "$file_path")
+}
+
+log_ipc_retention_progress() {
+    local force=${1:-false}
+    [[ "${IPC_RETENTION_PROGRESS_ACTIVE:-false}" == true ]] || return 0
+    if [[ "$force" != true ]] && (( SECONDS - IPC_RETENTION_LAST_LOG < IPC_RETENTION_INTERVAL )); then return 0; fi
+    IPC_RETENTION_LAST_LOG=$SECONDS
+    log_info "IPC retention progress: stage = [$IPC_RETENTION_STAGE], scope = [$cleanup_scope], directory = [$target_dir], scanned = [$IPC_RETENTION_SCANNED], candidates = [$IPC_RETENTION_CANDIDATES], removed = [$removed_count], reader_requests = [$((IPC_HISTORY_REQUESTS - IPC_RETENTION_REQUEST_START))], duration_s = [$((SECONDS - IPC_RETENTION_STARTED))], current = [$IPC_RETENTION_CURRENT]" || true
+}
+
 clean_old_files() {
     local target_dir=$1
     local target_class=$2
     local cleanup_scope=${3:-target}
     local old_file_manifest
     local removed_count=0
+    local IPC_RETENTION_READER_SCOPE=false IPC_RETENTION_OWNS_READER=false
+    local IPC_RETENTION_PROGRESS_ACTIVE=false
+    local IPC_RETENTION_INTERVAL=${IPC_RETENTION_PROGRESS_SECONDS:-10}
+    local IPC_RETENTION_STARTED=$SECONDS IPC_RETENTION_LAST_LOG=$SECONDS
+    local IPC_RETENTION_SCANNED=0 IPC_RETENTION_CANDIDATES=0
+    local IPC_RETENTION_REQUEST_START=$IPC_HISTORY_REQUESTS
+    local IPC_RETENTION_STAGE=scan_files IPC_RETENTION_CURRENT="$target_dir"
 
     if [[ ! -d "$target_dir" ]]; then
         log_warn "Skip cleanup because directory does not exist: [$target_dir]"
@@ -3527,6 +3625,15 @@ clean_old_files() {
         return 0
     fi
 
+    if [[ "$target_class" == ipc ]]; then
+        IPC_RETENTION_READER_SCOPE=true
+        if [[ ! "$IPC_RETENTION_INTERVAL" =~ ^(0|[1-9][0-9]{0,3})$ ]] || (( IPC_RETENTION_INTERVAL > 3600 )); then
+            log_warn "Invalid IPC_RETENTION_PROGRESS_SECONDS; using 10 seconds." || true
+            IPC_RETENTION_INTERVAL=10
+        fi
+        (( IPC_RETENTION_INTERVAL == 0 )) || IPC_RETENTION_PROGRESS_ACTIVE=true
+    fi
+    log_ipc_retention_progress true
     cleanup_old_directories_for_target "$target_dir" "$target_class"
 
     old_file_manifest=$(mktemp "$STATE_DIR/old_files.XXXXXX") ||
@@ -3536,6 +3643,7 @@ clean_old_files() {
         fail_now "failed to enumerate retention candidates: [$target_dir]"
     fi
 
+    IPC_RETENTION_STAGE=check_files
     while IFS= read -r -d $'\0' file; do
         local filename
         local file_date
@@ -3547,6 +3655,11 @@ clean_old_files() {
         local should_delete=false
 
         check_interruption_requested
+        if [[ "$target_class" == ipc ]]; then
+            IPC_RETENTION_SCANNED=$((IPC_RETENTION_SCANNED + 1))
+            IPC_RETENTION_CURRENT=$file
+            log_ipc_retention_progress false
+        fi
         if [[ "$cleanup_scope" == "source" ]] && ! is_source_backed_up "$file"; then
             continue
         fi
@@ -3570,7 +3683,12 @@ clean_old_files() {
                 should_delete=true
             fi
         else
-            file_mtime_epoch=$(get_file_mtime_epoch "$file")
+            if [[ "$target_class" == ipc ]]; then
+                get_ipc_retention_mtime_to_result "$file" || true
+                file_mtime_epoch=$FILE_MTIME_EPOCH_RESULT
+            else
+                file_mtime_epoch=$(get_file_mtime_epoch "$file")
+            fi
             if [[ "$file_mtime_epoch" =~ ^[0-9]+$ ]] &&
                (( file_mtime_epoch < cutoff_epoch )); then
                 should_delete=true
@@ -3581,6 +3699,7 @@ clean_old_files() {
             continue
         fi
 
+        IPC_RETENTION_CANDIDATES=$((IPC_RETENTION_CANDIDATES + 1))
         if $DRY_RUN; then
             log_info "[DRY-RUN] Would delete [${file_class}] file from ${cleanup_scope} retention: [$file]"
             continue
@@ -3604,6 +3723,9 @@ clean_old_files() {
         removed_count=$((removed_count + 1))
     done < "$old_file_manifest"
 
+    if $IPC_RETENTION_OWNS_READER; then stop_ipc_history_reader || true; fi
+    IPC_RETENTION_STAGE=complete
+    log_ipc_retention_progress true
     rm -f -- "$old_file_manifest"
     flush_ledger_buffer || fail_now "failed to flush retention ledger"
     log_info "Retention cleanup complete: scope = [$cleanup_scope], directory = [$target_dir], removed = [$removed_count]"

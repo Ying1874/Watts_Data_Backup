@@ -39,6 +39,15 @@ def fingerprint(path):
     ).encode("ascii")
 
 
+def mtime(path):
+    # GNU stat -c %Y uses lstat, integer seconds rounded toward minus infinity.
+    # Do not filter file types: preserve the original stat's metadata semantics.
+    try:
+        return str(os.stat(path, follow_symlinks=False).st_mtime_ns // 1_000_000_000).encode("ascii")
+    except OSError:
+        return None
+
+
 def close_inherited_descriptors():
     # Do this before READY: never retain Bash's instance/metadata lock, manifest
     # or pipe descriptors. listdir's temporary fd is already closed on return.
@@ -67,8 +76,13 @@ def field(reader, limit):
 
 
 def main():
-    if sys.version_info < (3, 8) or len(sys.argv) != 2 or not sys.argv[1].isdigit():
+    if sys.version_info < (3, 8) or len(sys.argv) not in (2, 3) or not sys.argv[1].isdigit():
         return 2
+    mode = sys.argv[2] if len(sys.argv) == 3 else "fingerprint"
+    if mode not in ("fingerprint", "mtime"):
+        return 2
+    version = VERSION if mode == "fingerprint" else b"ipc-mtime-v1"
+    read_metadata = fingerprint if mode == "fingerprint" else mtime
     parent = int(sys.argv[1])
     close_inherited_descriptors()
     # A closed stdin also ends the loop. PDEATHSIG additionally handles a parent
@@ -78,7 +92,7 @@ def main():
         return 2
     time.tzset()
     reader, writer = sys.stdin.buffer, sys.stdout.buffer
-    writer.write(b"READY\0" + VERSION + b"\0" + str(os.getpid()).encode() + b"\0")
+    writer.write(b"READY\0" + version + b"\0" + str(os.getpid()).encode() + b"\0")
     writer.flush()
     while True:
         sequence = field(reader, 19)
@@ -89,7 +103,7 @@ def main():
         path = field(reader, 65536)
         if path is None or not path:
             raise ValueError("invalid path")
-        value = fingerprint(path)
+        value = read_metadata(path)
         if value is None:
             writer.write(sequence + b"\0MISS\0\0")
         else:
