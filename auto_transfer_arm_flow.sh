@@ -3,6 +3,10 @@
 # ARM orchestration only. Transfer, verification and deletion primitives live
 # in auto_transfer_common.sh.
 auto_transfer_arm_main() {
+    if ! declare -F set_state_or_fail >/dev/null; then
+        printf '%s\n' '[ERROR] Incompatible backup modules: update common and flow scripts together.' >&2
+        return 1
+    fi
     local source_dir
     local target_dir
     local target_class
@@ -20,7 +24,7 @@ auto_transfer_arm_main() {
     ensure_state_files
     write_line_atomically "$PID_FILE" "$$" ||
         fail_now "failed to write pid file: $PID_FILE"
-    set_state "1" "running"
+    set_state_or_fail "1" "running"
     initialize_time_context
     require_commands \
         awk cat date df du find findmnt grep mktemp mv readlink realpath rm \
@@ -92,7 +96,7 @@ auto_transfer_arm_main() {
         check_interruption_requested
     done
     flush_ledger_buffer || fail_now "failed to flush transfer ledger"
-    set_state "2" "transfer_done"
+    set_state_or_fail "2" "transfer_done"
     finish_timed_phase
 
     # Time-based visual selection is not allowed to silently turn into a
@@ -108,7 +112,7 @@ auto_transfer_arm_main() {
         log_error "ARM transfer stopped at a fail-closed visual archive boundary; skipped all destructive cleanup: [$ARM_VISUAL_ARCHIVE_PLAN_BLOCK_DETAIL]"
         finish_timed_phase "blocked"
         log_phase_timing_summary "blocked"
-        set_state "-1" "$ARM_VISUAL_ARCHIVE_PLAN_BLOCK_DETAIL"
+        set_state_or_fail "-1" "$ARM_VISUAL_ARCHIVE_PLAN_BLOCK_DETAIL"
         return 1
     fi
 
@@ -127,7 +131,7 @@ auto_transfer_arm_main() {
         log_error "ARM transfer finished with collisions; skipped all destructive cleanup. ${conflict_summary}"
         finish_timed_phase "collision"
         log_phase_timing_summary "collision"
-        set_state "-1" "$conflict_summary"
+        set_state_or_fail "-1" "$conflict_summary"
         return 1
     fi
 
@@ -191,6 +195,6 @@ auto_transfer_arm_main() {
     log_info "=========== ARM transfer process completed ============"
     log_info "======================================================="
 
-    set_state "0" "cleanup_done"
+    set_state_or_fail "0" "cleanup_done"
     return 0
 }

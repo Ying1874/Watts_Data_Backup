@@ -418,22 +418,22 @@ rotate_run_logs() {
 # ======================
 # 设置任务状态状态文件与详细状态文件都走原子写入, 避免脚本被中断时留下半行内容
 set_state() {
-    local state_code=$1  # 状态码 (如 0/-1/1 等)
-    local state_text=$2  # 状态描述文本 (用于详细说明状态)
-    local state_parent   # 状态文件所在目录
-
-    state_parent=${STATE_FILE%/*}
-
-    # 确保目录存在 (-p: 递归创建)
-    # 2>/dev/null: 忽略错误输出
-    # || true: 即使失败也不影响脚本执行流
-    mkdir -p "$state_parent" 2>/dev/null || true
-
-    # 如果目录存在, 则写入状态文件
-    if [[ -d "$state_parent" ]]; then
-        write_line_atomically "$STATE_FILE" "$state_code" 2>/dev/null || true
-        write_line_atomically "$STATE_DETAIL_FILE" "$state_text" 2>/dev/null || true
+    local state_code=$1 state_text=$2
+    # Publish the code last. Two files are not a transaction; callers must
+    # propagate failure rather than claiming the old state is current.
+    if ! write_line_atomically "$STATE_DETAIL_FILE" "$state_text"; then
+        log_error "Failed to persist state detail: [$STATE_DETAIL_FILE]" >&2 || true
+        return 1
     fi
+    if ! write_line_atomically "$STATE_FILE" "$state_code"; then
+        log_error "Failed to persist state code: [$STATE_FILE]" >&2 || true
+        return 1
+    fi
+    return 0
+}
+
+set_state_or_fail() {
+    set_state "$@" || fail_now "failed to persist runtime state: code = [$1]"
 }
 
 # 统一错误退出函数
@@ -447,7 +447,7 @@ fail_now() {
     finish_timed_phase "failed"
     log_phase_timing_summary "failed"
     flush_ledger_buffer || true
-    set_state "-1" "$message"
+    set_state "-1" "$message" || true
     exit 1
 }
 
@@ -461,7 +461,7 @@ fail_interrupted() {
     finish_timed_phase "interrupted"
     log_phase_timing_summary "interrupted"
     flush_ledger_buffer || true
-    set_state "3" "$detail"
+    set_state "3" "$detail" || true
     exit 130
 }
 
@@ -1791,19 +1791,47 @@ calculate_sha256() {
 }
 
 calculate_sha256_to_result() {
-    local file_path=$1
-    local hash_output
+    local file_path=$1 hash_output hash_record="" read_status=0
 
     SHA256_RESULT=""
     hash_output=$(mktemp "$STATE_DIR/sha256.XXXXXX") || return 1
-    if ! run_interruptible_command sha256sum "$file_path" \
+    # GNU --zero suppresses filename escaping; keep the original tracked-child
+    # execution and file argument (background commands must not rely on stdin).
+    if ! run_interruptible_command sha256sum --zero -- "$file_path" \
         > "$hash_output" 2>/dev/null; then
         rm -f -- "$hash_output"
         return 1
     fi
-    IFS=' ' read -r SHA256_RESULT _ < "$hash_output" || true
+    IFS= read -r -d '' hash_record < "$hash_output" || read_status=$?
     rm -f -- "$hash_output"
-    [[ "$SHA256_RESULT" =~ ^[0-9a-f]{64}$ ]]
+    (( read_status == 0 )) || return 1
+    [[ "${hash_record:64:2}" == '  ' && "${hash_record:66}" == "$file_path" ]] || return 1
+    [[ "${hash_record:0:64}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    SHA256_RESULT=${hash_record:0:64}
+}
+
+prepare_copy_temp_path_to_result() {
+    local target_file=$1 candidate name attempt
+    local LC_ALL=C
+    candidate="$target_file.${RUNTIME_NAME}.$$.$RANDOM${TMP_SUFFIX}"
+    name=${candidate##*/}
+    # Keep the existing PID/random temporary-file model and cp creation modes.
+    # Only long names use a short basename. This does not add protection against
+    # concurrent directory replacement (outside this change's scope).
+    if (( ${#name} <= 255 )); then
+        COPY_TEMP_PATH_RESULT=$candidate
+        return 0
+    fi
+    for ((attempt=0;attempt<16;attempt++)); do
+        name=".${RUNTIME_NAME}.$$.$RANDOM.$RANDOM${TMP_SUFFIX}"
+        (( ${#name} <= 255 )) || return 1
+        candidate="${target_file%/*}/$name"
+        [[ ! -e "$candidate" && ! -L "$candidate" ]] || continue
+        COPY_TEMP_PATH_RESULT=$candidate
+        return 0
+    done
+    COPY_TEMP_PATH_RESULT=""
+    return 1
 }
 
 quote_path_for_log() {
@@ -2653,7 +2681,8 @@ quarantine_conflicting_source() {
         return 1
     }
 
-    temp_file="$quarantine_file.${RUNTIME_NAME}.$$.$RANDOM${TMP_SUFFIX}"
+    prepare_copy_temp_path_to_result "$quarantine_file" || return 1
+    temp_file=$COPY_TEMP_PATH_RESULT
     if ! run_interruptible_command cp --reflink=auto -- \
         "$source_file" "$temp_file" 2>> "$LOG_FILE"; then
         rm -f -- "$temp_file"
@@ -3206,7 +3235,9 @@ move_files_with_copy() {
             fail_now "failed to create target subdir before copy: [$target_subdir]"
         fi
 
-        temp_file="$target_file.${RUNTIME_NAME}.$$.$RANDOM${TMP_SUFFIX}"
+        prepare_copy_temp_path_to_result "$target_file" ||
+            fail_now "failed to select temporary copy path: [$target_file]"
+        temp_file=$COPY_TEMP_PATH_RESULT
         copy_error_file=$(mktemp "$STATE_DIR/cp_stderr.XXXXXX") || fail_now "failed to allocate copy error temp file"
 
         if should_preserve_copy_metadata_for_class "$target_class"; then

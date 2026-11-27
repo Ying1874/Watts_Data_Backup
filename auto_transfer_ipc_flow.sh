@@ -3,6 +3,10 @@
 # IPC orchestration only. IPC keeps verified source files until retention;
 # conflicting source data is eligible for retention only after quarantine.
 auto_transfer_ipc_main() {
+    if ! declare -F set_state_or_fail >/dev/null; then
+        printf '%s\n' '[ERROR] Incompatible backup modules: update common and flow scripts together.' >&2
+        return 1
+    fi
     local source_dir
     local target_dir
     local target_class
@@ -20,7 +24,7 @@ auto_transfer_ipc_main() {
     ensure_state_files
     write_line_atomically "$PID_FILE" "$$" ||
         fail_now "failed to write pid file: $PID_FILE"
-    set_state "1" "running"
+    set_state_or_fail "1" "running"
     require_commands \
         awk cat cp date df du find grep mktemp mv readlink realpath rm rmdir \
         sha256sum sort stat sync tail touch tr wc xargs
@@ -90,7 +94,7 @@ auto_transfer_ipc_main() {
             log_warn "Failed to persist IPC verified index; the next run will safely fall back to SHA-256 verification."
         fi
     fi
-    set_state "2" "transfer_done"
+    set_state_or_fail "2" "transfer_done"
     finish_timed_phase
 
     check_interruption_requested
@@ -144,15 +148,15 @@ auto_transfer_ipc_main() {
         conflict_summary="${conflict_summary}; quarantined = [${QUARANTINED_CONFLICT_TOTAL}]"
         log_error "IPC backup completed with collisions. ${conflict_summary}"
         log_phase_timing_summary "collision"
-        set_state "-1" "$conflict_summary"
+        set_state_or_fail "-1" "$conflict_summary"
         return 1
     fi
 
     log_phase_timing_summary "completed"
     if $TIME_TRUSTED; then
-        set_state "0" "cleanup_done"
+        set_state_or_fail "0" "cleanup_done"
     else
-        set_state "0" "transfer_done_retention_skipped:$TIME_TRUST_DETAIL"
+        set_state_or_fail "0" "transfer_done_retention_skipped:$TIME_TRUST_DETAIL"
     fi
     return 0
 }
